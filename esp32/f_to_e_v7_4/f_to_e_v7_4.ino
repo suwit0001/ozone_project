@@ -1,82 +1,29 @@
-#include <BluetoothSerial.h>
 #include <EEPROM.h>
+#include <HardwareSerial.h>
 
-#define RELAY_PIN      12
-#define FAN_PIN        14
-#define LED_PIN        2
-#define SENSOR_PIN     36
-#define EEPROM_SIZE    256
+#define EEPROM_SIZE 64
 
-// UART2 สำหรับ ESP-01
-HardwareSerial esp01Serial(2); // UART2 (GPIO16 TX, GPIO17 RX)
+// PIN Mapping
+#define OZONE_SENSOR_PIN 36
+#define RELAY_PIN 12
+#define FAN_PIN 14
+#define LED_PIN 2
 
-BluetoothSerial SerialBT;
+// UART2 ↔ ESP-01
+HardwareSerial espSerial(2); // UART2
+#define ESP01_RX 17
+#define ESP01_TX 16
 
-String wifiMode = "";
-String wifiIP = "";
-String authToken = "";
+// State
+String ssid, password, ip = "0.0.0.0", wifiMode = "";
+int targetOzone = 100;
+bool relayState = false;
+bool fanState = false;
 
-float targetOzone = 2.0;  // ค่าเป้าหมายเริ่มต้น
-
-// ==== EEPROM Helpers ====
-void loadConfig() {
-  EEPROM.begin(EEPROM_SIZE);
-  if (EEPROM.read(0) != 0xAA) {
-    wifiMode = "";
-    wifiIP = "";
-    authToken = "";
-    EEPROM.end();
-    return;
-  }
-
-  wifiMode   = EEPROMString(1, 32);
-  wifiIP     = EEPROMString(33, 32);
-  authToken  = EEPROMString(65, 64);
-  EEPROM.end();
-}
-
-void saveConfig(String mode, String ip, String token) {
-  EEPROM.begin(EEPROM_SIZE);
-  EEPROM.write(0, 0xAA);  // magic byte
-  EEPROMWriteString(1, mode, 32);
-  EEPROMWriteString(33, ip, 32);
-  EEPROMWriteString(65, token, 64);
-  EEPROM.commit();
-  EEPROM.end();
-}
-
-void clearEEPROM() {
-  EEPROM.begin(EEPROM_SIZE);
-  for (int i = 0; i < EEPROM_SIZE; i++) EEPROM.write(i, 0);
-  EEPROM.commit();
-  EEPROM.end();
-}
-
-String EEPROMString(int start, int len) {
-  char data[len + 1];
-  for (int i = 0; i < len; i++) {
-    data[i] = EEPROM.read(start + i);
-  }
-  data[len] = 0;
-  return String(data);
-}
-
-void EEPROMWriteString(int start, String value, int maxLen) {
-  int len = value.length();
-  if (len > maxLen) len = maxLen;
-  for (int i = 0; i < len; i++) {
-    EEPROM.write(start + i, value[i]);
-  }
-  for (int i = len; i < maxLen; i++) {
-    EEPROM.write(start + i, 0);
-  }
-}
-
-// ==== SETUP ====
 void setup() {
-  Serial.begin(115200);
-  SerialBT.begin("ESP32-OZONE");
-  esp01Serial.begin(9600, SERIAL_8N1, 17, 16);  // RX, TX
+  Serial.begin(9600); // Bluetooth
+  espSerial.begin(9600, SERIAL_8N1, ESP01_RX, ESP01_TX);
+  EEPROM.begin(EEPROM_SIZE);
 
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(FAN_PIN, OUTPUT);
@@ -86,85 +33,93 @@ void setup() {
   digitalWrite(LED_PIN, LOW);
 
   loadConfig();
-
-  Serial.println("ESP32 Ready.");
 }
 
-// ==== LOOP ====
 void loop() {
-  handleBluetoothCommands();
-  handleESP01Commands();
-  updateOzoneControl();
-  delay(200);
+  handleBluetooth();
 }
 
-// ==== Bluetooth Handler ====
-void handleBluetoothCommands() {
-  if (!SerialBT.available()) return;
+void handleBluetooth() {
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
 
-  String cmd = SerialBT.readStringUntil('\n');
-  cmd.trim();
-
-  if (cmd == "STATUS?") {
-    if (wifiMode != "") {
-      SerialBT.printf("STATUS:CONNECTED|%s|%s|%s\n", wifiMode.c_str(), wifiIP.c_str(), authToken.c_str());
-    } else {
-      SerialBT.println("STATUS:NOT_CONFIGURED");
+    if (cmd == "HANDSHAKE") {
+      Serial.println("ACK:" + wifiMode + "," + ip);
+    } else if (cmd.startsWith("SET_WIFI:")) {
+      parseAndConnectWiFi(cmd.substring(9));
+    } else if (cmd.startsWith("CONTROL:")) {
+      parseControl(cmd.substring(8));
+    } else if (cmd == "STATUS") {
+      sendStatus();
     }
-  } else if (cmd.startsWith("SET_WIFI:")) {
-    String creds = cmd.substring(9);
-    esp01Serial.println("SET_WIFI:" + creds);
-    SerialBT.println("FORWARDED_TO_ESP01");
-  } else if (cmd.startsWith("SAVE_WIFI_MODE:")) {
-    int first = cmd.indexOf(':') + 1;
-    int pipe1 = cmd.indexOf('|');
-    int pipe2 = cmd.indexOf('|', pipe1 + 1);
-    wifiMode = cmd.substring(first, pipe1);
-    wifiIP = cmd.substring(pipe1 + 1, pipe2);
-    authToken = cmd.substring(pipe2 + 1);
-    saveConfig(wifiMode, wifiIP, authToken);
-    SerialBT.println("CONFIG_SAVED");
-  } else if (cmd == "CLEAR_CONFIG") {
-    clearEEPROM();
-    SerialBT.println("CONFIG_CLEARED");
   }
 }
 
-// ==== ESP-01 (UART2) Command Handler ====
-void handleESP01Commands() {
-  if (!esp01Serial.available()) return;
-  String input = esp01Serial.readStringUntil('\n');
-  input.trim();
+void parseAndConnectWiFi(String data) {
+  int sep = data.indexOf(',');
+  ssid = data.substring(0, sep);
+  password = data.substring(sep + 1);
 
-  if (input.startsWith("{") && input.endsWith("}")) {
-    float t = getValue(input, "target").toFloat();
-    targetOzone = t;
+  sendAT("AT+RST", 2000);
+  sendAT("AT+CWMODE=1", 1000);
+  sendAT("AT+CWJAP=\"" + ssid + "\",\"" + password + "\"", 5000);
+  ip = sendAT("AT+CIFSR", 2000);
 
-    if (input.indexOf("\"relay\":true") != -1) digitalWrite(RELAY_PIN, HIGH);
-    else digitalWrite(RELAY_PIN, LOW);
+  wifiMode = "router";
+  saveConfig();
+  Serial.println("ACK:" + wifiMode + "," + ip);
+}
 
-    if (input.indexOf("\"fan\":true") != -1) digitalWrite(FAN_PIN, HIGH);
-    else digitalWrite(FAN_PIN, LOW);
+void parseControl(String data) {
+  if (data.indexOf("FAN_ON") != -1) {
+    fanState = true;
+    digitalWrite(FAN_PIN, HIGH);
+  }
+  if (data.indexOf("FAN_OFF") != -1) {
+    fanState = false;
+    digitalWrite(FAN_PIN, LOW);
+  }
+  if (data.indexOf("RELAY_ON") != -1) {
+    relayState = true;
+    digitalWrite(RELAY_PIN, HIGH);
+  }
+  if (data.indexOf("RELAY_OFF") != -1) {
+    relayState = false;
+    digitalWrite(RELAY_PIN, LOW);
+  }
+  if (data.indexOf("TARGET=") != -1) {
+    int val = data.substring(data.indexOf("TARGET=") + 7).toInt();
+    targetOzone = val;
   }
 }
 
-// ==== Control Logic ====
-void updateOzoneControl() {
-  int raw = analogRead(SENSOR_PIN);
-  float voltage = raw * (3.3 / 4095.0);
-  digitalWrite(LED_PIN, millis() / 500 % 2);  // กระพริบ LED
-
-  // ส่งค่า ozone ปัจจุบันกลับ ESP-01
-  String json = "{\"ozone\":" + String(voltage, 2) + "}";
-  esp01Serial.println(json);
+void sendStatus() {
+  int ozone = analogRead(OZONE_SENSOR_PIN);
+  Serial.println("STATUS:O3=" + String(ozone) + ",FAN=" + String(fanState) + ",RELAY=" + String(relayState) + ",TARGET=" + String(targetOzone));
 }
 
-// ==== JSON Helper ====
-String getValue(String json, String key) {
-  int i = json.indexOf("\"" + key + "\":");
-  if (i == -1) return "";
-  int start = json.indexOf(":", i) + 1;
-  int end = json.indexOf(",", start);
-  if (end == -1) end = json.indexOf("}", start);
-  return json.substring(start, end);
+// ===== EEPROM SAVE/LOAD =====
+
+void saveConfig() {
+  EEPROM.writeString(0, wifiMode);
+  EEPROM.writeString(20, ip);
+  EEPROM.commit();
+}
+
+void loadConfig() {
+  wifiMode = EEPROM.readString(0);
+  ip = EEPROM.readString(20);
+}
+
+// ====== AT Command ======
+
+String sendAT(String cmd, int delayTime) {
+  espSerial.println(cmd);
+  delay(delayTime);
+  String response = "";
+  while (espSerial.available()) {
+    response += espSerial.readString();
+  }
+  return response;
 }
